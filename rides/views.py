@@ -1,11 +1,16 @@
+import logging
 from datetime import timedelta
 
 from django.db.models import Prefetch
 from django.utils import timezone
 from rest_framework import viewsets
+from rest_framework.authtoken.models import Token
+from rest_framework.authtoken.serializers import AuthTokenSerializer
+from rest_framework.authtoken.views import ObtainAuthToken
 from rest_framework.exceptions import ValidationError
+from rest_framework.response import Response
 
-from .distance import annotate_distance
+from .distance import InvalidCoordinateError, annotate_distance, parse_coordinate
 from .filters import RideFilter
 from .models import Ride, RideEvent, User
 from .serializers import (
@@ -14,8 +19,41 @@ from .serializers import (
     RideSerializer,
     UserSerializer,
 )
+from .throttling import LoginRateThrottle
+
+logger = logging.getLogger("rides.security")
 
 ALLOWED_SORT_FIELDS = {"pickup_time", "distance"}
+LATITUDE_BOUND = 90.0
+LONGITUDE_BOUND = 180.0
+
+
+class ThrottledObtainAuthToken(ObtainAuthToken):
+    """Same behavior as DRF's obtain_auth_token, but actually rate-limited.
+
+    `ObtainAuthToken` hard-codes `throttle_classes = ()` and
+    `permission_classes = ()`, which opts it out of the project-wide
+    throttle settings - meaning the default view has no brute-force
+    protection at all (OWASP A07). This subclass restores throttling
+    without touching the (intentionally anonymous) permission behavior.
+    """
+
+    throttle_classes = [LoginRateThrottle]
+
+    def post(self, request, *args, **kwargs):
+        serializer = AuthTokenSerializer(data=request.data, context={"request": request})
+        client_ip = request.META.get("REMOTE_ADDR")
+        if not serializer.is_valid():
+            logger.warning(
+                "Failed login attempt for username=%r from %s",
+                request.data.get("username"), client_ip,
+            )
+            serializer.is_valid(raise_exception=True)
+
+        user = serializer.validated_data["user"]
+        token, _ = Token.objects.get_or_create(user=user)
+        logger.info("Successful login for user_id=%s from %s", user.pk, client_ip)
+        return Response({"token": token.key})
 
 
 class UserViewSet(viewsets.ModelViewSet):
@@ -76,10 +114,10 @@ class RideViewSet(viewsets.ModelViewSet):
                      "pickup_longitude": "Required when sort_by=distance."}
                 )
             try:
-                lat, lng = float(lat), float(lng)
-            except ValueError:
-                raise ValidationError({"pickup_latitude": "Must be a valid float.",
-                                        "pickup_longitude": "Must be a valid float."})
+                lat = parse_coordinate(lat, bound=LATITUDE_BOUND, field_name="pickup_latitude")
+                lng = parse_coordinate(lng, bound=LONGITUDE_BOUND, field_name="pickup_longitude")
+            except InvalidCoordinateError as exc:
+                raise ValidationError({"detail": str(exc)})
             queryset = annotate_distance(queryset, lat, lng)
 
         order_field = f"-{field}" if descending else field

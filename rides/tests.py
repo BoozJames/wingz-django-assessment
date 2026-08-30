@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+from django.core.cache import cache
 from django.test.utils import CaptureQueriesContext
 from django.db import connection
 from django.urls import reverse
@@ -132,3 +133,70 @@ class RideListAPITests(BaseAPITestCase):
         response = self.client.get("/api/rides/")
         for key in ("count", "next", "previous", "results"):
             self.assertIn(key, response.data)
+
+    def test_sort_by_distance_rejects_non_finite_coordinates(self):
+        for lat, lng in [("nan", "0"), ("inf", "0"), ("0", "-inf")]:
+            response = self.client.get(
+                f"/api/rides/?sort_by=distance&pickup_latitude={lat}&pickup_longitude={lng}"
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_sort_by_distance_rejects_out_of_range_coordinates(self):
+        response = self.client.get(
+            "/api/rides/?sort_by=distance&pickup_latitude=999&pickup_longitude=0"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class UserPasswordSecurityTests(BaseAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(self.admin)
+
+    def test_created_user_password_is_hashed_and_never_returned(self):
+        response = self.client.post("/api/users/", {
+            "first_name": "New", "last_name": "Hire", "email": "new.hire@example.com",
+            "role": User.Role.RIDER, "password": "S0me-Str0ng-Passw0rd!",
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertNotIn("password", response.data)
+
+        created = User.objects.get(pk=response.data["id"])
+        self.assertNotEqual(created.password, "S0me-Str0ng-Passw0rd!")
+        self.assertTrue(created.check_password("S0me-Str0ng-Passw0rd!"))
+
+    def test_weak_password_is_rejected(self):
+        response = self.client.post("/api/users/", {
+            "first_name": "Weak", "last_name": "Pw", "email": "weak.pw@example.com",
+            "role": User.Role.RIDER, "password": "1234",
+        })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class LoginThrottleTests(BaseAPITestCase):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_repeated_failed_logins_are_throttled(self):
+        # settings.py configures the 'login' throttle scope at 5/min.
+        for _ in range(5):
+            response = self.client.post(
+                "/api/api-token-auth/", {"username": "admin", "password": "wrong"}
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        throttled = self.client.post(
+            "/api/api-token-auth/", {"username": "admin", "password": "wrong"}
+        )
+        self.assertEqual(throttled.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_valid_login_issues_a_token(self):
+        response = self.client.post(
+            "/api/api-token-auth/", {"username": "admin", "password": "pass1234"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("token", response.data)

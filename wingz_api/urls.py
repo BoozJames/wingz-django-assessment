@@ -16,10 +16,11 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import include, path
-from rest_framework.authtoken.views import obtain_auth_token
+
+from rides.views import ThrottledObtainAuthToken
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('rides.urls')),
-    path('api/api-token-auth/', obtain_auth_token, name='api-token-auth'),
+    path('api/api-token-auth/', ThrottledObtainAuthToken.as_view(), name='api-token-auth'),
 ]
