@@ -203,6 +203,31 @@ Notes:
 - The join conditions on `pickup_event`/`dropoff_event` assume exactly one pickup and one
   dropoff event per completed ride, as stated in the assessment.
 
+### Running the report for real
+
+The query above is written against the assessment's spec schema (`id_ride`, `id_user`,
+`Ride_Event`). This project's actual tables use Django's default `id` primary key plus
+the `id_rider`/`id_driver`/`id_ride` foreign-key columns from the spec — the same
+relationships, just Django-generated PK names. To see the report run against your own
+seeded data instead of just reading SQL:
+
+```bash
+python manage.py trip_duration_report
+```
+
+This executes the same join/aggregation logic (SQLite or PostgreSQL, auto-detected from
+`connection.vendor`) and prints a table in the same shape as the assessment's sample
+report. Example output against the default `seed_data` fixtures:
+
+```
+Month    Driver    Count of Trips > 1 hr
+-------  --------  ---------------------
+2026-03  Alicia M  3
+2026-03  Randy W   1
+2026-04  Chris H   2
+...
+```
+
 ## Running tests
 
 ```bash
@@ -213,7 +238,7 @@ Covers: permission enforcement (anonymous/non-admin/admin), status and rider-ema
 filtering, both sort modes (including validation errors for missing/non-finite/out-of-range
 coordinates), pagination shape, the `todays_ride_events` 24-hour cutoff, the bounded
 query-count guarantee for the Ride List API, password hashing on user creation, weak-password
-rejection, and login throttling.
+rejection, login throttling, and the `trip_duration_report` command's month/driver grouping.
 
 ## Sample data
 

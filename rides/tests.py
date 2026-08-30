@@ -1,6 +1,9 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
+from io import StringIO
 
 from django.core.cache import cache
+from django.core.management import call_command
+from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
 from django.db import connection
 from django.urls import reverse
@@ -200,3 +203,51 @@ class LoginThrottleTests(BaseAPITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("token", response.data)
+
+
+class TripDurationReportCommandTests(TestCase):
+    """Covers the `trip_duration_report` management command (bonus SQL report)."""
+
+    def setUp(self):
+        self.driver = User.objects.create_user(
+            username="driver_report", password="x", role=User.Role.DRIVER,
+            first_name="Jamie", last_name="Ortiz",
+        )
+        self.rider = User.objects.create_user(
+            username="rider_report", password="x", role=User.Role.RIDER
+        )
+
+    def _make_ride_with_events(self, pickup_time, trip_minutes):
+        ride = Ride.objects.create(
+            status=Ride.Status.DROPOFF, rider=self.rider, driver=self.driver,
+            pickup_latitude=0, pickup_longitude=0, dropoff_latitude=0, dropoff_longitude=0,
+            pickup_time=pickup_time,
+        )
+        RideEvent.objects.create(
+            ride=ride, description="Status changed to pickup", created_at=pickup_time
+        )
+        RideEvent.objects.create(
+            ride=ride, description="Status changed to dropoff",
+            created_at=pickup_time + timedelta(minutes=trip_minutes),
+        )
+        return ride
+
+    def test_report_counts_only_trips_over_one_hour(self):
+        pickup_time = timezone.make_aware(datetime(2026, 3, 15, 10, 0, 0))
+        self._make_ride_with_events(pickup_time, 90)  # > 1hr: counted
+        self._make_ride_with_events(pickup_time, 30)  # <= 1hr: excluded
+
+        out = StringIO()
+        call_command("trip_duration_report", stdout=out)
+        output = out.getvalue()
+
+        self.assertIn("2026-03", output)
+        self.assertIn("Jamie O", output)
+        lines = [line for line in output.splitlines() if "2026-03" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].rstrip().endswith("1"))
+
+    def test_report_handles_no_matching_trips(self):
+        out = StringIO()
+        call_command("trip_duration_report", stdout=out)
+        self.assertIn("No trips longer than 1 hour found.", out.getvalue())
