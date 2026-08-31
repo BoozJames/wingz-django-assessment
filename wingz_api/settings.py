@@ -10,23 +10,38 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 import sys
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+load_dotenv(BASE_DIR / '.env')
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
+_INSECURE_DEV_SECRET_KEY = 'django-insecure-kz%)jcq6x%-dn(6o5cns186(#4h)eg36z%a-vdl(ia#6(986l$'
+
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-kz%)jcq6x%-dn(6o5cns186(#4h)eg36z%a-vdl(ia#6(986l$'
+# Read from the environment so it's never committed; falls back to an
+# obviously-fake dev key so `manage.py runserver` still works out of the box.
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', _INSECURE_DEV_SECRET_KEY)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get('DJANGO_ALLOWED_HOSTS', '').split(',') if h.strip()]
+
+if not DEBUG:
+    # Fail fast instead of silently deploying with dev-grade settings.
+    if SECRET_KEY == _INSECURE_DEV_SECRET_KEY:
+        raise RuntimeError('Set DJANGO_SECRET_KEY before running with DEBUG=False.')
+    if not ALLOWED_HOSTS:
+        raise RuntimeError('Set DJANGO_ALLOWED_HOSTS before running with DEBUG=False.')
 
 
 # Application definition
@@ -128,6 +143,22 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 AUTH_USER_MODEL = 'rides.User'
 
+# --- Security hardening (OWASP A02: Cryptographic Failures / A05: Security
+# Misconfiguration) -----------------------------------------------------
+# These only bite in production (DEBUG=False) so local HTTP development
+# still works without a TLS cert.
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SESSION_COOKIE_HTTPONLY = True
+X_FRAME_OPTIONS = 'DENY'
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.TokenAuthentication',
@@ -141,6 +172,32 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'rides.pagination.StandardResultsSetPagination',
     'PAGE_SIZE': 20,
+    # OWASP A04/A07: bound how fast a single client can hammer the API,
+    # independent of the stricter per-endpoint login throttle below.
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '30/min',
+        'user': '120/min',
+        'login': '5/min',
+    },
+}
+
+# OWASP A09: Security Logging and Monitoring Failures - surface auth/permission
+# failures instead of letting them disappear silently.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler'},
+    },
+    'root': {'handlers': ['console'], 'level': 'INFO'},
+    'loggers': {
+        'django.security': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
+        'rides.security': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+    },
 }
 
 # Password hashing is intentionally slow; use a fast hasher for `manage.py test`

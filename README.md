@@ -7,6 +7,7 @@ Wingz Python/Django Developer Test.
 
 - Python 3.11, Django 5.2, Django REST Framework 3.18, django-filter 26
 - SQLite for local development (default Django settings, zero setup)
+- python-dotenv for loading `DJANGO_SECRET_KEY` / `DJANGO_DEBUG` / `DJANGO_ALLOWED_HOSTS` from a local `.env` file (see [Security](#security))
 
 ## Setup
 
@@ -42,6 +43,10 @@ password: adminpass123
 ```
 
 (You can also run `python manage.py createsuperuser` and set `role='admin'` on it via `/admin/`.)
+
+No `.env` file is required for local development — `DJANGO_DEBUG` defaults to `True`
+with a dev-only fallback secret key. Copy `.env.example` to `.env` only when you need to
+override those defaults (e.g. to test production settings locally).
 
 ## Authentication
 
@@ -198,6 +203,31 @@ Notes:
 - The join conditions on `pickup_event`/`dropoff_event` assume exactly one pickup and one
   dropoff event per completed ride, as stated in the assessment.
 
+### Running the report for real
+
+The query above is written against the assessment's spec schema (`id_ride`, `id_user`,
+`Ride_Event`). This project's actual tables use Django's default `id` primary key plus
+the `id_rider`/`id_driver`/`id_ride` foreign-key columns from the spec — the same
+relationships, just Django-generated PK names. To see the report run against your own
+seeded data instead of just reading SQL:
+
+```bash
+python manage.py trip_duration_report
+```
+
+This executes the same join/aggregation logic (SQLite or PostgreSQL, auto-detected from
+`connection.vendor`) and prints a table in the same shape as the assessment's sample
+report. Example output against the default `seed_data` fixtures:
+
+```
+Month    Driver    Count of Trips > 1 hr
+-------  --------  ---------------------
+2026-03  Alicia M  3
+2026-03  Randy W   1
+2026-04  Chris H   2
+...
+```
+
 ## Running tests
 
 ```bash
@@ -205,9 +235,10 @@ python manage.py test rides
 ```
 
 Covers: permission enforcement (anonymous/non-admin/admin), status and rider-email
-filtering, both sort modes (including the validation error when `sort_by=distance` is
-used without coordinates), pagination shape, the `todays_ride_events` 24-hour cutoff, and
-the bounded query-count guarantee for the Ride List API.
+filtering, both sort modes (including validation errors for missing/non-finite/out-of-range
+coordinates), pagination shape, the `todays_ride_events` 24-hour cutoff, the bounded
+query-count guarantee for the Ride List API, password hashing on user creation, weak-password
+rejection, login throttling, and the `trip_duration_report` command's month/driver grouping.
 
 ## Sample data
 
@@ -220,11 +251,39 @@ the bounded query-count guarantee for the Ride List API.
   SQL report has data to aggregate), plus a few recent events for `todays_ride_events`
   to demonstrate against.
 
+## Security
+
+Mapped against the OWASP API/Top 10 categories most relevant to this project:
+
+| Category | What's done | Where |
+|---|---|---|
+| **A01 Broken Access Control** | Every endpoint defaults to deny; `IsAdminRole` requires an authenticated user whose `role == 'admin'` (distinct from Django's `is_staff`/`is_superuser`). Denied attempts by authenticated users are logged. | `rides/permissions.py` |
+| **A02 Cryptographic Failures** | Passwords are never stored or returned in plaintext — `UserSerializer` hashes via `set_password()`/Django's validators and the field is `write_only`. `SECRET_KEY` is read from the environment, never committed. Production (`DEBUG=False`) forces `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`, HSTS, and SSL redirect. | `rides/serializers.py`, `wingz_api/settings.py` |
+| **A03 Injection** | 100% Django ORM — no raw SQL, `.extra()`, or string-built queries anywhere in the executable code (the bonus report query is documentation only, never executed by the app). User-supplied floats for distance sorting are bound as parameterized `Value()` expressions, never interpolated into SQL. | `rides/distance.py` |
+| **A04 Insecure Design** | Distance-sort coordinates are validated as finite, in-range numbers before use — a bare `float()` call would otherwise accept `"nan"`/`"inf"` and silently corrupt every row's computed ordering. Serializers use explicit `fields` allow-lists (never `"__all__"`), so new model fields aren't accidentally exposed for mass assignment. | `rides/distance.py::parse_coordinate`, `rides/serializers.py` |
+| **A05 Security Misconfiguration** | `DEBUG`/`SECRET_KEY`/`ALLOWED_HOSTS` come from the environment; the app refuses to start with `DEBUG=False` unless a real secret key and explicit allowed hosts are set. `X_FRAME_OPTIONS`, `SECURE_CONTENT_TYPE_NOSNIFF`, `SESSION_COOKIE_HTTPONLY` are on unconditionally. | `wingz_api/settings.py` |
+| **A06 Vulnerable/Outdated Components** | Dependencies are pinned in `requirements.txt`; run `pip list --outdated` periodically and re-run the test suite after bumping versions. | `requirements.txt` |
+| **A07 Auth Failures** | The token-login endpoint is rate-limited (`5/min` per IP) — DRF's stock `obtain_auth_token` view explicitly disables throttling, so a custom `ThrottledObtainAuthToken` restores it. All other endpoints are throttled too (`30/min` anon, `120/min` authenticated) as defense in depth. Django's standard password validators (min length, common-password, similarity, numeric-only checks) apply to any password set through the API. | `rides/throttling.py`, `rides/views.py::ThrottledObtainAuthToken` |
+| **A09 Logging & Monitoring Failures** | Failed logins, successful logins, and denied-permission attempts are logged (to `rides.security` / console) with the acting user id and path — enough to spot brute-force or privilege-escalation attempts after the fact, without logging credentials. | `rides/permissions.py`, `rides/views.py` |
+
+Notes / things intentionally left out of scope:
+
+- **CORS**: not configured, since this API isn't paired with a browser frontend in this
+  assessment. If one is added, install `django-cors-headers` and set an explicit
+  `CORS_ALLOWED_ORIGINS` allow-list — never `CORS_ALLOW_ALL_ORIGINS = True`.
+- **Token expiry**: DRF's `Token` model doesn't expire. For production, swap to
+  `djangorestframework-simplejwt` (short-lived access tokens + refresh) or add a
+  scheduled job to rotate/expire stale tokens.
+- **A08 (Software/Data Integrity)** and **A10 (SSRF)** aren't applicable — there's no
+  deserialization of untrusted data beyond DRF's JSON parser, and the app makes no
+  outbound requests based on user input.
+
 ## Known limitations / possible follow-ups
 
 - Distance sorting computes Haversine distance per-row at query time (see above) — no
   spatial index is possible without changing the Ride table schema.
 - `rider_email` filtering is exact-match (case-insensitive); a partial-match option could
   be added with `lookup_expr="icontains"` if that's the desired UX.
-- Token issuance uses DRF's built-in `obtain_auth_token`; a production system would likely
-  want token expiry/refresh (e.g. `djangorestframework-simplejwt`).
+- Token issuance uses a throttled wrapper around DRF's `obtain_auth_token`; a production
+  system would likely want short-lived tokens with refresh (e.g. `djangorestframework-simplejwt`)
+  rather than DRF's non-expiring `Token` model.

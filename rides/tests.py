@@ -1,5 +1,9 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
+from io import StringIO
 
+from django.core.cache import cache
+from django.core.management import call_command
+from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
 from django.db import connection
 from django.urls import reverse
@@ -132,3 +136,118 @@ class RideListAPITests(BaseAPITestCase):
         response = self.client.get("/api/rides/")
         for key in ("count", "next", "previous", "results"):
             self.assertIn(key, response.data)
+
+    def test_sort_by_distance_rejects_non_finite_coordinates(self):
+        for lat, lng in [("nan", "0"), ("inf", "0"), ("0", "-inf")]:
+            response = self.client.get(
+                f"/api/rides/?sort_by=distance&pickup_latitude={lat}&pickup_longitude={lng}"
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_sort_by_distance_rejects_out_of_range_coordinates(self):
+        response = self.client.get(
+            "/api/rides/?sort_by=distance&pickup_latitude=999&pickup_longitude=0"
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class UserPasswordSecurityTests(BaseAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(self.admin)
+
+    def test_created_user_password_is_hashed_and_never_returned(self):
+        response = self.client.post("/api/users/", {
+            "first_name": "New", "last_name": "Hire", "email": "new.hire@example.com",
+            "role": User.Role.RIDER, "password": "S0me-Str0ng-Passw0rd!",
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertNotIn("password", response.data)
+
+        created = User.objects.get(pk=response.data["id"])
+        self.assertNotEqual(created.password, "S0me-Str0ng-Passw0rd!")
+        self.assertTrue(created.check_password("S0me-Str0ng-Passw0rd!"))
+
+    def test_weak_password_is_rejected(self):
+        response = self.client.post("/api/users/", {
+            "first_name": "Weak", "last_name": "Pw", "email": "weak.pw@example.com",
+            "role": User.Role.RIDER, "password": "1234",
+        })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class LoginThrottleTests(BaseAPITestCase):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_repeated_failed_logins_are_throttled(self):
+        # settings.py configures the 'login' throttle scope at 5/min.
+        for _ in range(5):
+            response = self.client.post(
+                "/api/api-token-auth/", {"username": "admin", "password": "wrong"}
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        throttled = self.client.post(
+            "/api/api-token-auth/", {"username": "admin", "password": "wrong"}
+        )
+        self.assertEqual(throttled.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_valid_login_issues_a_token(self):
+        response = self.client.post(
+            "/api/api-token-auth/", {"username": "admin", "password": "pass1234"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("token", response.data)
+
+
+class TripDurationReportCommandTests(TestCase):
+    """Covers the `trip_duration_report` management command (bonus SQL report)."""
+
+    def setUp(self):
+        self.driver = User.objects.create_user(
+            username="driver_report", password="x", role=User.Role.DRIVER,
+            first_name="Jamie", last_name="Ortiz",
+        )
+        self.rider = User.objects.create_user(
+            username="rider_report", password="x", role=User.Role.RIDER
+        )
+
+    def _make_ride_with_events(self, pickup_time, trip_minutes):
+        ride = Ride.objects.create(
+            status=Ride.Status.DROPOFF, rider=self.rider, driver=self.driver,
+            pickup_latitude=0, pickup_longitude=0, dropoff_latitude=0, dropoff_longitude=0,
+            pickup_time=pickup_time,
+        )
+        RideEvent.objects.create(
+            ride=ride, description="Status changed to pickup", created_at=pickup_time
+        )
+        RideEvent.objects.create(
+            ride=ride, description="Status changed to dropoff",
+            created_at=pickup_time + timedelta(minutes=trip_minutes),
+        )
+        return ride
+
+    def test_report_counts_only_trips_over_one_hour(self):
+        pickup_time = timezone.make_aware(datetime(2026, 3, 15, 10, 0, 0))
+        self._make_ride_with_events(pickup_time, 90)  # > 1hr: counted
+        self._make_ride_with_events(pickup_time, 30)  # <= 1hr: excluded
+
+        out = StringIO()
+        call_command("trip_duration_report", stdout=out)
+        output = out.getvalue()
+
+        self.assertIn("2026-03", output)
+        self.assertIn("Jamie O", output)
+        lines = [line for line in output.splitlines() if "2026-03" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].rstrip().endswith("1"))
+
+    def test_report_handles_no_matching_trips(self):
+        out = StringIO()
+        call_command("trip_duration_report", stdout=out)
+        self.assertIn("No trips longer than 1 hour found.", out.getvalue())
